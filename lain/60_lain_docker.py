@@ -6,57 +6,71 @@ from __future__ import print_function
 import urllib
 import docker
 import json
-import os
 import time
 import argparse
-
-ENDPOINT = "lain"
-CONFIGS = {}
-
-OUT_DATA = []
+import socket
 
 
-class Plugin:
-    @classmethod
-    def create_record(cls, metric, value, lain_info, metric_type="GAUGE"):
-        interval = CONFIGS['interval']
-        host = lain_info["host"]
-        plugin = lain_info["plugin"]
-        plugin = plugin.replace('-', '_')
-        plugin_instance = lain_info["plugin_instance"]
-        type, type_instance = metric.split('.')
+class AppCollector(object):
+    COLLECT_LIST = ['cpu', 'memory', 'blkio', 'network']
+
+    _timeout = 5
+
+    _endpoint = "lain"
+    _host = socket.gethostname()
+    _step = 60
+
+    def __init__(self, stats, info):
+        self._result = []
+        self.stats = stats
+        self.info = info
+
+    def run(self):
+        self._result = []
+        for item in self.COLLECT_LIST:
+            self._collect(item)
+            if len(self._result) > 0:
+                print(json.dumps(self._result))
+
+    def _append_result(self, metric, val, lain_info, counter_ty="GAUGE"):
+        endpoint = lain_info["endpoint"]
+        metric = lain_info["metric"] + "." + metric
         data = {
-            'Metric': "%s-%s.%s-%s" % (plugin, plugin_instance, type, type_instance),
-            'Endpoint': ENDPOINT,
+            'Metric': metric,
+            'Endpoint': endpoint,
             'Timestamp': int(time.time()),
-            'Step': interval,
-            'Value': value,
-            'CounterType': "GAUGE",
-            'TAGS': "host=%s" % host,
+            'Step': self._step,
+            'Value': val,
+            'CounterType': counter_ty,
+            'TAGS': "host=%s" % self._host,
         }
-        OUT_DATA.append(data)
+        self._result.append(data)
 
+    def _collect(self, item):
+        try:
+            return getattr(self, "_collect_%s_stats" % item)()
+        except:
+            return False
 
-class CpuStats(Plugin):
-
-    @classmethod
-    def get(cls, stats, lain_info):
+    def _collect_cpu_stats(self):
         # docker cpu stats is nanoseconds, plus 100 for percent, *100/1e9 =
         # /1e7
-        cls.create_record("cpu.total", int(
+        stats = self.stats
+        lain_info = self.info
+
+        self._append_result("cpu.total", int(
             int(stats["cpu_stats"]["cpu_usage"]["total_usage"]) / 1e7), lain_info)
-        cls.create_record("cpu.user", int(
+        self._append_result("cpu.user", int(
             int(stats["cpu_stats"]["cpu_usage"]["usage_in_usermode"]) / 1e7), lain_info)
-        cls.create_record("cpu.kernel", int(
+        self._append_result("cpu.kernel", int(
             int(stats["cpu_stats"]["cpu_usage"]["usage_in_kernelmode"]) / 1e7), lain_info)
 
+    def _collect_memory_stats(self):
+        stats = self.stats
+        lain_info = self.info
 
-class MemoryStats(Plugin):
-
-    @classmethod
-    def get(cls, stats, lain_info):
         usage = stats["memory_stats"]["usage"]
-        cls.create_record("memory.usage", usage, lain_info)
+        self._append_result("memory.usage", usage, lain_info)
 
         stat_list = stats["memory_stats"]["stats"]
         if not stat_list:
@@ -65,30 +79,28 @@ class MemoryStats(Plugin):
             if stat.startswith("total_"):
                 metric = "memory.%s" % (stat[6:])
                 value = stat_list[stat]
-                cls.create_record(metric, value, lain_info)
+                self._append_result(metric, value, lain_info)
 
+    def _collect_blkio_stats(self):
+        """
+        "blkio_stats": {
+            "io_merged_recursive": [],
+            "io_queue_recursive": [],
+            "io_service_bytes_recursive": [],
+            "io_service_time_recursive": [],
+            "io_serviced_recursive": [],
+            "io_time_recursive": [],
+            "io_wait_time_recursive": [],
+            "sectors_recursive": []
+        }
+        """
 
-"""
-"blkio_stats": {
-    "io_merged_recursive": [],
-    "io_queue_recursive": [],
-    "io_service_bytes_recursive": [],
-    "io_service_time_recursive": [],
-    "io_serviced_recursive": [],
-    "io_time_recursive": [],
-    "io_wait_time_recursive": [],
-    "sectors_recursive": []
-}
-"""
+        # blkio-io_service_bytes_recursive-253-0-READ
+        BLKIO_KEY_FORMAT = 'blkio.%s-%s-%s-%s'
 
-# blkio-io_service_bytes_recursive-253-0-READ
-BLKIO_KEY_FORMAT = 'blkio.%s-%s-%s-%s'
+        stats = self.stats
+        lain_info = self.info
 
-
-class BlkioStats(Plugin):
-
-    @classmethod
-    def get(cls, stats, lain_info):
         for stat, value in stats["blkio_stats"].iteritems():
             blk_stats = {}
             for item in value:
@@ -97,34 +109,31 @@ class BlkioStats(Plugin):
                 blk_stats[key] = item['value']
 
             for key, value in blk_stats.iteritems():
-                cls.create_record(
+                self._append_result(
                     key, value, lain_info, "COUNTER")
 
+    def _collect_network_stats(self):
+        """
+        "networks": {
+            "rx_bytes": 0,
+            "rx_dropped": 0,
+            "rx_errors": 0,
+            "rx_packets": 0,
+            "tx_bytes": 0,
+            "tx_dropped": 0,
+            "tx_errors": 0,
+            "tx_packets": 0
+        },
+        """
+        stats = self.stats
+        lain_info = self.info
 
-"""
-"networks": {
-    "rx_bytes": 0,
-    "rx_dropped": 0,
-    "rx_errors": 0,
-    "rx_packets": 0,
-    "tx_bytes": 0,
-    "tx_dropped": 0,
-    "tx_errors": 0,
-    "tx_packets": 0
-},
-"""
-
-
-class NetworkStats(Plugin):
-
-    @classmethod
-    def get(cls, stats, lain_info):
         if "networks" not in stats:
             return
         for interface in stats["networks"]:
             for stat in stats["networks"][interface]:
-                cls.create_record("net.%s-%s" % (interface, stat),
-                                  stats["networks"][interface][stat], lain_info, "COUNTER")
+                self._append_result("net.%s-%s" % (interface, stat),
+                                    stats["networks"][interface][stat], lain_info, "COUNTER")
 
 
 class Docker:
@@ -210,36 +219,23 @@ class Lainlet(object):
     def get_info(cls, containers, depends, container_id, container_name):
         info = {}
         if container_id in containers:
-            info["plugin"] = "app.%s.proc.%s" % (
-                containers[container_id]["app_name"],
+            info["endpoint"] = containers[container_id]["app_name"]
+            info["metric"] = "%s-%s-%s" % (
+                containers[container_id]["proc_type"],
                 containers[container_id]["proc_name"],
+                containers[container_id]["instance_no"],
             )
-            info["plugin_instance"] = containers[container_id]["instance_no"]
-            info["host"] = CONFIGS['domain']
             return info
         name = container_name.rpartition('.')[0]
         if name in depends:
-            info["plugin"] = "app.%s.portal.%s.%s.%s" % (
-                depends[name]["service_name"],
+            info["endpoint"] = depends[name]["service_name"],
+            info["metric"] = "portal-%s-%s-%s" % (
                 depends[name]["portal_name"],
                 depends[name]["app_name"],
                 depends[name]["node_name"],
             )
-            info["plugin_instance"] = "0"
-            info["host"] = CONFIGS['domain']
             return info
-        # non-lain app: calico/swarm
-        info["plugin"] = "docker.%s" % container_name.replace('.', '_')
-        info["plugin_instance"] = "0"
-        info["host"] = CONFIGS["hostname"]
         return info
-
-
-CONFIGS['hostname'] = os.uname()[1]
-CONFIGS['interval'] = 60
-
-CLASSES = [CpuStats, MemoryStats, NetworkStats, BlkioStats]
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -248,8 +244,7 @@ if __name__ == "__main__":
     parser.add_argument("--domain", help="lain domain",
                         default="lain.local", type=str)
     args = parser.parse_args()
-    CONFIGS['domain'] = args.domain.replace('.', '_')
-    lainlet = Lainlet(args.lainlet_endpoint, CONFIGS['hostname'])
+    lainlet = Lainlet(args.lainlet_endpoint, socket.gethostname())
 
     containers = lainlet.get_containers()
     depends = lainlet.get_depends()
@@ -264,6 +259,5 @@ if __name__ == "__main__":
         lain_info = lainlet.get_info(
             containers, depends, container_id, container_name)
 
-        for klass in CLASSES:
-            klass.get(stats, lain_info)
-    print(json.dumps(OUT_DATA))
+        collector = AppCollector(stats, lain_info)
+        collector.run()
