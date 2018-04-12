@@ -42,7 +42,7 @@ class AppCollector(object):
             'Step': self._step,
             'Value': val,
             'CounterType': counter_ty,
-            'TAGS': "host=%s" % self._host,
+            'TAGS': "",
         }
         self._result.append(data)
 
